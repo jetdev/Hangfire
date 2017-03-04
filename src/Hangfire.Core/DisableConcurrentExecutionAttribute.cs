@@ -33,10 +33,7 @@ namespace Hangfire
 
         public void OnPerforming(PerformingContext filterContext)
         {
-            var resource = String.Format(
-                "{0}.{1}",
-                filterContext.Job.Type.FullName,
-                filterContext.Job.Method.Name);
+            var resource = GetResource(filterContext.BackgroundJob.Job);
 
             var timeout = TimeSpan.FromSeconds(_timeoutInSeconds);
 
@@ -53,6 +50,11 @@ namespace Hangfire
 
             var distributedLock = (IDisposable)filterContext.Items["DistributedLock"];
             distributedLock.Dispose();
+        }
+
+        private static string GetResource(Job job)
+        {
+            return $"{job.Type.ToGenericTypeString()}.{job.Method.Name}";
         }
     }
 }

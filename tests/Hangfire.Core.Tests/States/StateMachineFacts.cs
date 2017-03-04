@@ -1,355 +1,186 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using Hangfire.Common;
 using Hangfire.States;
 using Hangfire.Storage;
 using Moq;
+#if NETFULL
+using Moq.Sequences;
+#endif
 using Xunit;
+
+// ReSharper disable AssignNullToNotNullAttribute
 
 namespace Hangfire.Core.Tests.States
 {
     public class StateMachineFacts
     {
-        private const string StateName = "State";
-        private const string JobId = "1";
-        private const string OldStateName = "Old";
-        private static readonly string[] FromOldState = { OldStateName };
+        private const string OldStateName = "OldState";
+        private const string JobId = "job";
 
-        private readonly Mock<IStorageConnection> _connection;
-        private readonly Job _job;
-        private readonly Dictionary<string, string> _parameters;
-        private readonly Mock<IState> _state;
-        private readonly Mock<IStateChangeProcess> _stateChangeProcess;
-        private readonly Mock<IDisposable> _distributedLock;
+        private readonly List<object> _filters = new List<object>();
+        
+        private readonly Mock<IWriteOnlyTransaction> _transaction;
+        private readonly ApplyStateContextMock _context;
+        private readonly Mock<IJobFilterProvider> _filterProvider;
+        
+        private readonly Mock<IStateMachine> _innerMachine;
 
         public StateMachineFacts()
         {
-            _stateChangeProcess = new Mock<IStateChangeProcess>();
+            var connection = new Mock<IStorageConnection>();
+            _transaction = new Mock<IWriteOnlyTransaction>();
+            connection.Setup(x => x.CreateWriteTransaction()).Returns(_transaction.Object);
 
-            _job = Job.FromExpression(() => Console.WriteLine());
-            _parameters = new Dictionary<string, string>();
-            _state = new Mock<IState>();
-            _state.Setup(x => x.Name).Returns(StateName);
+            var backgroundJob = new BackgroundJobMock { Id = JobId };
+            _context = new ApplyStateContextMock
+            {
+                BackgroundJob = backgroundJob,
+                OldStateName = OldStateName,
+                Transaction = _transaction
+            };
 
-            _connection = new Mock<IStorageConnection>();
-
-            _connection.Setup(x => x.CreateExpiredJob(
-                It.IsAny<Job>(),
-                It.IsAny<IDictionary<string, string>>(),
-                It.IsAny<DateTime>(),
-                It.IsAny<TimeSpan>())).Returns(JobId);
-
-            _connection.Setup(x => x.GetJobData(JobId))
-                .Returns(new JobData
-                {
-                    State = OldStateName,
-                    Job = _job
-                });
-
-            _distributedLock = new Mock<IDisposable>();
-            _connection
-                .Setup(x => x.AcquireDistributedLock(String.Format("job:{0}:state-lock", JobId), It.IsAny<TimeSpan>()))
-                .Returns(_distributedLock.Object);
-
-            _stateChangeProcess
-                .Setup(x => x.ChangeState(
-                    It.Is<StateContext>(s => s.JobId == JobId && s.Job == _job && s.Connection == _connection.Object), 
-                    _state.Object, 
-                    OldStateName))
-                .Returns(true);
+            _filterProvider = new Mock<IJobFilterProvider>();
+            _filterProvider.Setup(x => x.GetFilters(It.IsNotNull<Job>())).Returns(
+                _filters.Select(f => new JobFilter(f, JobFilterScope.Type, null)));
+            
+            _innerMachine = new Mock<IStateMachine>();
         }
 
         [Fact]
-        public void Ctor_ThrowsAnException_WhenConnectionIsNull()
+        public void Ctor_ThrowsAnException_WhenFilterProviderIsNull()
         {
             var exception = Assert.Throws<ArgumentNullException>(
-                () => new StateMachine(null, _stateChangeProcess.Object));
+                () => new StateMachine(null, _innerMachine.Object));
 
-            Assert.Equal("connection", exception.ParamName);
+            Assert.Equal("filterProvider", exception.ParamName);
         }
 
         [Fact]
-        public void Ctor_ThrowsAnException_WhenStateChangeProcessIsNull()
+        public void Ctor_ThrowsAnException_WhenInnerStateMachineIsNull()
         {
             var exception = Assert.Throws<ArgumentNullException>(
-                () => new StateMachine(_connection.Object, null));
+                () => new StateMachine(_filterProvider.Object, null));
 
-            Assert.Equal("stateChangeProcess", exception.ParamName);
+            Assert.Equal("innerStateMachine", exception.ParamName);
         }
 
         [Fact]
-        public void CreateInState_ThrowsAnException_WhenJobIsNull()
-        {
-            var stateMachine = CreateStateMachine();
-
-            var exception = Assert.Throws<ArgumentNullException>(
-                () => stateMachine.CreateInState(null, _parameters, _state.Object));
-
-            Assert.Equal("job", exception.ParamName);
-        }
-
-        [Fact]
-        public void CreateInState_ThrowsAnException_WhenParametersIsNull()
-        {
-            var stateMachine = CreateStateMachine();
-
-            var exception = Assert.Throws<ArgumentNullException>(
-                () => stateMachine.CreateInState(_job, null, _state.Object));
-
-            Assert.Equal("parameters", exception.ParamName);
-        }
-
-        [Fact]
-        public void CreateInState_ThrowsAnException_WhenStateIsNull()
-        {
-            var stateMachine = CreateStateMachine();
-
-            var exception = Assert.Throws<ArgumentNullException> (
-                () => stateMachine.CreateInState(_job, _parameters, null));
-
-            Assert.Equal("state", exception.ParamName);
-        }
-
-        [Fact]
-        public void CreateInState_CreatesExpiredJob()
-        {
-            var job = Job.FromExpression(() => Console.WriteLine("SomeString"));
-            _parameters.Add("Name", "Value");
-
-            var stateMachine = CreateStateMachine();
-
-            stateMachine.CreateInState(job, _parameters, _state.Object);
-
-            _connection.Verify(x => x.CreateExpiredJob(
-				job,
-                It.Is<Dictionary<string, string>>(d => d["Name"] == "Value"),
-                It.IsAny<DateTime>(),
-                It.IsAny<TimeSpan>()));
-        }
-
-        [Fact]
-        public void CreateInState_ChangesTheStateOfACreatedJob()
-        {
-            var stateMachine = CreateStateMachine();
-
-            stateMachine.CreateInState(_job, _parameters, _state.Object);
-
-            _stateChangeProcess.Verify(x => x.ChangeState(
-                It.Is<StateContext>(sc => sc.JobId == JobId && sc.Job == _job),
-                _state.Object,
-                null));
-        }
-
-        [Fact]
-        public void CreateInState_ReturnsNewJobId()
-        {
-            var stateMachine = CreateStateMachine();
-            Assert.Equal(JobId, stateMachine.CreateInState(_job, _parameters, _state.Object));
-        }
-
-        [Fact]
-        public void TryToChangeState_ThrowsAnException_WhenJobIdIsNull()
-        {
-            var stateMachine = CreateStateMachine();
-
-            var exception = Assert.Throws<ArgumentNullException>(
-                () => stateMachine.TryToChangeState(null, _state.Object, FromOldState));
-
-            Assert.Equal("jobId", exception.ParamName);
-        }
-
-        [Fact]
-        public void TryToChangeState_ThrowsAnException_WhenToStateIsNull()
-        {
-            var stateMachine = CreateStateMachine();
-
-            var exception = Assert.Throws<ArgumentNullException>(
-                () => stateMachine.TryToChangeState(JobId, null, FromOldState));
-
-            Assert.Equal("toState", exception.ParamName);
-        }
-
-        [Fact]
-        public void TryToChangeState_ThrowsAnException_WhenFromStatesIsEmpty()
-        {
-            var stateMachine = CreateStateMachine();
-
-            var exception = Assert.Throws<ArgumentException>(
-                () => stateMachine.TryToChangeState(JobId, _state.Object, new string[0]));
-
-            Assert.Equal("fromStates", exception.ParamName);
-        }
-
-        [Fact]
-        public void TryToChangeState_WorksWithinAJobLock()
-        {
-            var stateMachine = CreateStateMachine();
-
-            stateMachine.TryToChangeState(JobId, _state.Object, FromOldState);
-
-            _distributedLock.Verify(x => x.Dispose());
-        }
-
-        [Fact]
-        public void TryToChangeState_ChangesTheStateOfTheJob()
+        public void ApplyState_CallsElectionFilterWithCorrectProperties()
         {
             // Arrange
+            var filter = CreateFilter<IElectStateFilter>();
+            
             var stateMachine = CreateStateMachine();
 
             // Act
-            var result = stateMachine.TryToChangeState(JobId, _state.Object, FromOldState);
+            stateMachine.ApplyState(_context.Object);
 
-            // Assert
-            _stateChangeProcess.Verify(x => x.ChangeState(
-                It.Is<StateContext>(sc => sc.JobId == JobId && sc.Job.Type.Name.Equals("Console")),
-                _state.Object,
-                OldStateName));
-
-            Assert.True(result);
+            filter.Verify(x => x.OnStateElection(It.Is<ElectStateContext>(context =>
+                context.Storage == _context.Storage.Object &&
+                context.Connection == _context.Connection.Object &&
+                context.BackgroundJob == _context.BackgroundJob.Object &&
+                context.CandidateState == _context.NewState.Object &&
+                context.CurrentState == _context.OldStateName)));
         }
 
-        [Fact]
-        public void TryToChangeState_ChangesTheStateOfTheJob_WhenFromStatesIsNull()
+#if NETFULL
+        [Fact, SequenceAttribute]
+        public void ApplyState_CallsElectionFilters()
         {
             // Arrange
-            var stateMachine = CreateStateMachine();
+            var filter1 = CreateFilter<IElectStateFilter>();
+            var filter2 = CreateFilter<IElectStateFilter>();
 
-            // Act
-            stateMachine.TryToChangeState(JobId, _state.Object, null);
-
-            // Assert
-            _stateChangeProcess.Verify(x => x.ChangeState(
-                It.IsNotNull<StateContext>(),
-                _state.Object,
-                OldStateName));
-        }
-
-        [Fact]
-        public void TryToChangeState_ReturnsFalse_WhenJobIsNotFound()
-        {
-            // Arrange
-            _connection.Setup(x => x.GetJobData(It.IsAny<string>()))
-                .Returns((JobData)null);
+            filter1.Setup(x => x.OnStateElection(It.IsAny<ElectStateContext>()))
+                .InSequence();
+            filter2.Setup(x => x.OnStateElection(It.IsAny<ElectStateContext>()))
+                .InSequence();
 
             var stateMachine = CreateStateMachine();
 
             // Act
-            var result = stateMachine.TryToChangeState(JobId, _state.Object, FromOldState);
+            stateMachine.ApplyState(_context.Object);
 
-            // Assert
-            Assert.False(result);
-            _connection.Verify(x => x.GetJobData(JobId));
-
-            _stateChangeProcess.Verify(
-                x => x.ChangeState(It.IsAny<StateContext>(), It.IsAny<IState>(), It.IsAny<string>()),
-                Times.Never);
+            // Assert - Sequence
         }
+#endif
 
         [Fact]
-        public void TryToChangeState_ReturnsFalse_WhenFromStatesArgumentDoesNotContainCurrentState()
+        public void ApplyState_AddsJobHistory_ForTraversedStates()
         {
             // Arrange
-            var stateMachine = CreateStateMachine();
-
-            // Act
-            var result = stateMachine.TryToChangeState(
-                JobId, _state.Object, new [] { "AnotherState" });
-
-            // Assert
-            Assert.False(result);
-
-            _stateChangeProcess.Verify(
-                x => x.ChangeState(It.IsAny<StateContext>(), It.IsAny<IState>(), It.IsAny<string>()),
-                Times.Never);
-        }
-
-        [Fact]
-        public void TryToChangeState_ReturnsFalse_WhenStateChangeReturnsFalse()
-        {
-            // Arrange
-            _stateChangeProcess
-                .Setup(x => x.ChangeState(It.IsAny<StateContext>(), It.IsAny<IState>(), It.IsAny<string>()))
-                .Returns(false);
+            var anotherState = new Mock<IState>();
+            var filter = CreateFilter<IElectStateFilter>();
+            filter.Setup(x => x.OnStateElection(It.IsNotNull<ElectStateContext>()))
+                .Callback<ElectStateContext>(context => context.CandidateState = anotherState.Object);
 
             var stateMachine = CreateStateMachine();
 
             // Act
-            var result = stateMachine.TryToChangeState(JobId, _state.Object, FromOldState);
+            stateMachine.ApplyState(_context.Object);
 
             // Assert
-            _stateChangeProcess.Verify(
-                x => x.ChangeState(It.IsAny<StateContext>(), It.IsAny<IState>(), It.IsAny<string>()));
-
-            Assert.False(result);
+            _context.Transaction.Verify(x => x.AddJobState(JobId, _context.NewState.Object));
         }
 
-        [Fact]
-        public void TryToChangeState_MoveJobToTheFailedState_IfMethodDataCouldNotBeResolved()
+#if NETFULL
+        [Fact, Sequence]
+        public void ApplyState_CallsStateUnappliedFilters_BeforeCallingInnerStateMachine()
         {
             // Arrange
-            _connection.Setup(x => x.GetJobData(JobId))
-                .Returns(new JobData
-                {
-                    State = OldStateName,
-                    Job = null,
-                    LoadException = new JobLoadException("asd", new InvalidOperationException())
-                });
+            var filter1 = CreateFilter<IApplyStateFilter>();
+            var filter2 = CreateFilter<IApplyStateFilter>();
 
-            _stateChangeProcess
-                .Setup(x => x.ChangeState(It.IsAny<StateContext>(), It.IsAny<IState>(), It.IsAny<string>()))
-                .Returns(true);
+            filter1.Setup(x => x.OnStateUnapplied(It.IsNotNull<ApplyStateContext>(), _transaction.Object))
+                .InSequence();
+            filter2.Setup(x => x.OnStateUnapplied(It.IsNotNull<ApplyStateContext>(), _transaction.Object))
+                .InSequence();
+            _innerMachine
+                .Setup(x => x.ApplyState(It.IsAny<ApplyStateContext>()))
+                .InSequence();
 
             var stateMachine = CreateStateMachine();
 
             // Act
-            var result = stateMachine.TryToChangeState(JobId, _state.Object, FromOldState);
+            stateMachine.ApplyState(_context.Object);
 
-            // Assert
-            _stateChangeProcess.Verify(x => x.ChangeState(
-                It.Is<StateContext>(sc => sc.JobId == JobId && sc.Job == null),
-                It.Is<FailedState>(s => s.Exception != null),
-                OldStateName));
-
-            Assert.False(result);
+            // Assert - Sequence
         }
 
-        [Fact]
-        public void TryToChangeState_MoveJobToTheGivenState_IfStateIgnoresThisException_AndMethodDataCouldNotBeResolved()
+        [Fact, Sequence]
+        public void ApplyState_CallsStateAppliedFilters_AfterSettingTheState()
         {
             // Arrange
-            _connection.Setup(x => x.GetJobData(JobId))
-                .Returns(new JobData
-                {
-                    State = OldStateName,
-                    Job = null,
-                    LoadException = new JobLoadException("asd", new Exception())
-                });
+            var filter1 = CreateFilter<IApplyStateFilter>();
+            var filter2 = CreateFilter<IApplyStateFilter>();
 
-            _stateChangeProcess
-                .Setup(x => x.ChangeState(It.IsAny<StateContext>(), It.IsAny<IState>(), It.IsAny<string>()))
-                .Returns(true);
-
-            _state.Setup(x => x.IgnoreJobLoadException).Returns(true);
+            filter1.Setup(x => x.OnStateApplied(It.IsNotNull<ApplyStateContext>(), _transaction.Object))
+                .InSequence();
+            filter2.Setup(x => x.OnStateApplied(It.IsNotNull<ApplyStateContext>(), _transaction.Object))
+                .InSequence();
 
             var stateMachine = CreateStateMachine();
 
             // Act
-            var result = stateMachine.TryToChangeState(JobId, _state.Object, FromOldState);
+            stateMachine.ApplyState(_context.Object);
 
-            // Assert
-            _stateChangeProcess.Verify(x => x.ChangeState(
-                It.IsAny<StateContext>(),
-                _state.Object,
-                OldStateName));
-
-            Assert.True(result);
+            // Assert - Sequence
         }
-
+#endif
+        
         private StateMachine CreateStateMachine()
         {
-            return new StateMachine(
-                _connection.Object,
-                _stateChangeProcess.Object);
+            return new StateMachine(_filterProvider.Object, _innerMachine.Object);
+        }
+
+        private Mock<T> CreateFilter<T>() where T : class
+        {
+            var filter = new Mock<T>();
+            _filters.Add(filter.Object);
+
+            return filter;
         }
     }
 }

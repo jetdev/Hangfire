@@ -16,93 +16,111 @@
 
 using System;
 using System.Collections.Generic;
-using System.Data;
+using System.Data.Common;
 using System.Linq;
+#if NETFULL
+using System.Transactions;
+#else
+using System.Data;
+#endif
 using Dapper;
+using Hangfire.Annotations;
+
+// ReSharper disable RedundantAnonymousTypePropertyName
 
 namespace Hangfire.SqlServer
 {
     internal class SqlServerJobQueueMonitoringApi : IPersistentJobQueueMonitoringApi
     {
-        private readonly IDbConnection _connection;
+        private static readonly TimeSpan QueuesCacheTimeout = TimeSpan.FromSeconds(5);
 
-        public SqlServerJobQueueMonitoringApi(IDbConnection connection)
+        private readonly SqlServerStorage _storage;
+        private readonly object _cacheLock = new object();
+
+        private List<string> _queuesCache = new List<string>();
+        private DateTime _cacheUpdated;
+
+        public SqlServerJobQueueMonitoringApi([NotNull] SqlServerStorage storage)
         {
-            if (connection == null) throw new ArgumentNullException("connection");
-
-            _connection = connection;
+            if (storage == null) throw new ArgumentNullException(nameof(storage));
+            _storage = storage;
         }
 
         public IEnumerable<string> GetQueues()
         {
-            const string sqlQuery = @"select distinct(Queue) from HangFire.JobQueue";
-            return _connection.Query(sqlQuery).Select(x => (string)x.Queue).ToList();
+            string sqlQuery = $@"select distinct(Queue) from [{_storage.SchemaName}].JobQueue with (nolock)";
+
+            lock (_cacheLock)
+            {
+                if (_queuesCache.Count == 0 || _cacheUpdated.Add(QueuesCacheTimeout) < DateTime.UtcNow)
+                {
+                    var result = UseTransaction((connection, transaction) =>
+                    {
+                        return connection.Query(sqlQuery, transaction: transaction, commandTimeout: _storage.CommandTimeout).Select(x => (string) x.Queue).ToList();
+                    });
+
+                    _queuesCache = result;
+                    _cacheUpdated = DateTime.UtcNow;
+                }
+
+                return _queuesCache.ToList();
+            }  
         }
 
         public IEnumerable<int> GetEnqueuedJobIds(string queue, int @from, int perPage)
         {
-            const string sqlQuery = @"
-select r.Id from (
-  select j.Id, row_number() over (order by j.Id) as row_num 
-  from HangFire.JobQueue jq
-  left join HangFire.Job j on jq.JobId = j.Id
-  left join HangFire.State s on s.Id = j.StateId
-  where jq.Queue = @queue and jq.FetchedAt is null
+            string sqlQuery =
+$@"select r.JobId from (
+  select jq.JobId, row_number() over (order by jq.Id) as row_num 
+  from [{_storage.SchemaName}].JobQueue jq with (nolock)
+  where jq.Queue = @queue
 ) as r
 where r.row_num between @start and @end";
 
-            return _connection.Query<JobIdDto>(
-                sqlQuery,
-                new { queue = queue, start = from + 1, end = @from + perPage })
-                .ToList()
-                .Select(x => x.Id)
-                .ToList();
+            return UseTransaction((connection, transaction) =>
+            {
+                // TODO: Remove cast to `int` to support `bigint`.
+                return connection.Query<JobIdDto>(
+                    sqlQuery,
+                    new { queue = queue, start = from + 1, end = @from + perPage },
+                    transaction,
+                    commandTimeout: _storage.CommandTimeout)
+                    .ToList()
+                    .Select(x => (int)x.JobId)
+                    .ToList();
+            });
         }
 
         public IEnumerable<int> GetFetchedJobIds(string queue, int @from, int perPage)
         {
-            const string fetchedJobsSql = @"
-select r.Id from (
-  select j.Id, jq.FetchedAt, row_number() over (order by j.Id) as row_num 
-  from HangFire.JobQueue jq
-  left join HangFire.Job j on jq.JobId = j.Id
-  where jq.Queue = @queue and jq.FetchedAt is not null
-) as r
-where r.row_num between @start and @end";
-
-            return _connection.Query<JobIdDto>(
-                fetchedJobsSql,
-                new { queue = queue, start = from + 1, end = @from + perPage })
-                .ToList()
-                .Select(x => x.Id)
-                .ToList();
+            return Enumerable.Empty<int>();
         }
 
         public EnqueuedAndFetchedCountDto GetEnqueuedAndFetchedCount(string queue)
         {
-            const string sqlQuery = @"
-select sum(Enqueued) as EnqueuedCount, sum(Fetched) as FetchedCount 
-from (
-    select 
-	    case when FetchedAt is null then 1 else 0 end as Enqueued,
-	    case when FetchedAt is not null then 1 else 0 end as Fetched
-    from HangFire.JobQueue
-    where Queue = @queue
-) q";
+            string sqlQuery = $@"
+select count(Id) from [{_storage.SchemaName}].JobQueue with (nolock) where [Queue] = @queue";
 
-            var result = _connection.Query(sqlQuery, new { queue = queue }).Single();
-
-            return new EnqueuedAndFetchedCountDto
+            return UseTransaction((connection, transaction) =>
             {
-                EnqueuedCount = result.EnqueuedCount,
-                FetchedCount = result.FetchedCount
-            };
+                var result = connection.ExecuteScalar<int>(sqlQuery, new { queue = queue }, transaction, commandTimeout: _storage.CommandTimeout);
+
+                return new EnqueuedAndFetchedCountDto
+                {
+                    EnqueuedCount = result,
+                };
+            });
         }
 
-// ReSharper disable once ClassNeverInstantiated.Local
+        private T UseTransaction<T>(Func<DbConnection, DbTransaction, T> func)
+        {
+            return _storage.UseTransaction(func, IsolationLevel.ReadUncommitted);
+        }
+
         private class JobIdDto
         {
-            public int Id { get; set; }
+            [UsedImplicitly]
+            public long JobId { get; set; }
         }
     }
 }

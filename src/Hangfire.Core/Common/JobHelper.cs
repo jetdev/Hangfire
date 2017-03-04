@@ -23,26 +23,33 @@ namespace Hangfire.Common
 {
     public static class JobHelper
     {
+        private static JsonSerializerSettings _serializerSettings;
+
+        public static void SetSerializerSettings(JsonSerializerSettings setting)
+        {
+            _serializerSettings = setting;
+        }
+
         public static string ToJson(object value)
         {
-            return value != null 
-                ? JsonConvert.SerializeObject(value)
+            return value != null
+                ? JsonConvert.SerializeObject(value, _serializerSettings)
                 : null;
         }
 
         public static T FromJson<T>(string value)
         {
-            return value != null 
-                ? JsonConvert.DeserializeObject<T>(value)
+            return value != null
+                ? JsonConvert.DeserializeObject<T>(value, _serializerSettings)
                 : default(T);
         }
 
         public static object FromJson(string value, [NotNull] Type type)
         {
-            if (type == null) throw new ArgumentNullException("type");
+            if (type == null) throw new ArgumentNullException(nameof(type));
 
             return value != null
-                ? JsonConvert.DeserializeObject(value, type)
+                ? JsonConvert.DeserializeObject(value, type, _serializerSettings)
                 : null;
         }
 

@@ -4,6 +4,8 @@ using Hangfire.States;
 using Moq;
 using Xunit;
 
+// ReSharper disable PossibleNullReferenceException
+
 namespace Hangfire.Core.Tests
 {
     public class BackgroundJobFacts
@@ -48,6 +50,18 @@ namespace Hangfire.Core.Tests
         }
 
         [Fact, GlobalLock(Reason = "Access BackgroundJob.ClientFactory member")]
+        public void Schedule_WithDateTimeOffset_CreatesAJobInScheduledState()
+        {
+            Initialize();
+
+            BackgroundJob.Schedule(() => Method(), DateTimeOffset.Now);
+
+            _client.Verify(x => x.Create(
+                It.IsNotNull<Job>(),
+                It.IsNotNull<ScheduledState>()));
+        }
+
+        [Fact, GlobalLock(Reason = "Access BackgroundJob.ClientFactory member")]
         public void ScheduleGeneric_WithTimeSpan_CreatesAJobInScheduledState()
         {
             Initialize();
@@ -57,6 +71,18 @@ namespace Hangfire.Core.Tests
             _client.Verify(x => x.Create(
                 It.IsNotNull<Job>(),
                 It.Is<ScheduledState>(state => state.EnqueueAt > DateTime.UtcNow)));
+        }
+
+        [Fact, GlobalLock(Reason = "Access BackgroundJob.ClientFactory member")]
+        public void ScheduleGeneric_WithDateTimeOffset_CreatesAJobInScheduledState()
+        {
+            Initialize();
+
+            BackgroundJob.Schedule<BackgroundJobFacts>(x => x.Method(), DateTimeOffset.Now);
+
+            _client.Verify(x => x.Create(
+                It.IsNotNull<Job>(),
+                It.IsNotNull<ScheduledState>()));
         }
 
         [Fact, GlobalLock]

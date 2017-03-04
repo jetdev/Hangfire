@@ -6,11 +6,19 @@ namespace Hangfire.Core.Tests
     public class JobCancellationTokenFacts
     {
         [Fact]
+        public void ShutdownToken_IsInCanceledState_WhenPassingTrueValue()
+        {
+            var token = new JobCancellationToken(true);
+            Assert.True(token.ShutdownToken.IsCancellationRequested);
+        }
+
+        [Fact]
         public void ThrowIfCancellationRequested_DoesNotThrowOnFalseValue()
         {
             var token = new JobCancellationToken(false);
 
-            Assert.DoesNotThrow(token.ThrowIfCancellationRequested);
+            // Does not throw
+            token.ThrowIfCancellationRequested();
         }
 
         [Fact]

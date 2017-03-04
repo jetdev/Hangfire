@@ -17,48 +17,104 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading;
-using Common.Logging;
 using Hangfire.Annotations;
+using Hangfire.Client;
 using Hangfire.Common;
+using Hangfire.Logging;
 using Hangfire.States;
 using Hangfire.Storage;
 using NCrontab;
 
 namespace Hangfire.Server
 {
-    internal class RecurringJobScheduler : IServerComponent
+    /// <summary>
+    /// Represents a background process responsible for <i>enqueueing recurring 
+    /// jobs</i>.
+    /// </summary>
+    /// 
+    /// <remarks>
+    /// <para>This background process polls the <i>recurring job schedule</i>
+    /// for recurring jobs ready to be enqueued. Interval between scheduler
+    /// polls is hard-coded to <b>1 minute</b> as a compromise between
+    /// frequency and additional stress on job storage.</para>
+    /// 
+    /// <note type="tip">
+    /// Use custom background processes if you need to schedule recurring jobs
+    /// with frequency less than one minute. Please see the 
+    /// <see cref="IBackgroundProcess"/> interface for details.
+    /// </note>
+    /// 
+    /// <para>Recurring job schedule is based on Set and Hash data structures
+    /// of a job storage, so you can use this background process as an example 
+    /// of a custom extension.</para>
+    /// 
+    /// <para>Multiple instances of this background process can be used in
+    /// separate threads/processes without additional configuration (distributed
+    /// locks are used). However, this only adds support for fail-over, and does 
+    /// not increase the performance.</para>
+    /// 
+    /// <note type="important">
+    /// If you are using <b>custom filter providers</b>, you need to pass a 
+    /// custom <see cref="IBackgroundJobFactory"/> instance to make this 
+    /// process respect your filters when enqueueing background jobs.
+    /// </note>
+    /// </remarks>
+    /// 
+    /// <threadsafety static="true" instance="true"/>
+    /// 
+    /// <seealso cref="RecurringJobManager"/>
+    public class RecurringJobScheduler : IBackgroundProcess
     {
         private static readonly TimeSpan LockTimeout = TimeSpan.FromMinutes(1);
-        private static readonly ILog Logger = LogManager.GetCurrentClassLogger();
-
-        private readonly JobStorage _storage;
-        private readonly IBackgroundJobClient _client;
-        private readonly IScheduleInstantFactory _instantFactory;
+        private static readonly ILog Logger = LogProvider.For<RecurringJobScheduler>();
+        
+        private readonly IBackgroundJobFactory _factory;
+        private readonly Func<CrontabSchedule, TimeZoneInfo, IScheduleInstant> _instantFactory;
         private readonly IThrottler _throttler;
 
-        public RecurringJobScheduler(
-            [NotNull] JobStorage storage,
-            [NotNull] IBackgroundJobClient client,
-            [NotNull] IScheduleInstantFactory instantFactory,
+        /// <summary>
+        /// Initializes a new instance of the <see cref="RecurringJobScheduler"/>
+        /// class with default background job factory.
+        /// </summary>
+        public RecurringJobScheduler()
+            : this(new BackgroundJobFactory())
+        {
+        }
+        
+        /// <summary>
+        /// Initializes a new instance of the <see cref="RecurringJobScheduler"/>
+        /// class with custom background job factory.
+        /// </summary>
+        /// <param name="factory">Factory that will be used to create background jobs.</param>
+        /// 
+        /// <exception cref="ArgumentNullException"><paramref name="factory"/> is null.</exception>
+        public RecurringJobScheduler([NotNull] IBackgroundJobFactory factory)
+            : this(factory, ScheduleInstant.Factory, new EveryMinuteThrottler())
+        {
+        }
+
+        internal RecurringJobScheduler(
+            [NotNull] IBackgroundJobFactory factory,
+            [NotNull] Func<CrontabSchedule, TimeZoneInfo, IScheduleInstant> instantFactory,
             [NotNull] IThrottler throttler)
         {
-            if (storage == null) throw new ArgumentNullException("storage");
-            if (client == null) throw new ArgumentNullException("client");
-            if (instantFactory == null) throw new ArgumentNullException("instantFactory");
-            if (throttler == null) throw new ArgumentNullException("throttler");
-
-            _storage = storage;
-            _client = client;
+            if (factory == null) throw new ArgumentNullException(nameof(factory));
+            if (instantFactory == null) throw new ArgumentNullException(nameof(instantFactory));
+            if (throttler == null) throw new ArgumentNullException(nameof(throttler));
+            
+            _factory = factory;
             _instantFactory = instantFactory;
             _throttler = throttler;
         }
 
-        public void Execute(CancellationToken cancellationToken)
+        /// <inheritdoc />
+        public void Execute(BackgroundProcessContext context)
         {
-            _throttler.Throttle(cancellationToken);
+            if (context == null) throw new ArgumentNullException(nameof(context));
 
-            using (var connection = _storage.GetConnection())
+            _throttler.Throttle(context.CancellationToken);
+
+            using (var connection = context.Storage.GetConnection())
             using (connection.AcquireDistributedLock("recurring-jobs:lock", LockTimeout))
             {
                 var recurringJobIds = connection.GetAllItemsFromSet("recurring-jobs");
@@ -66,7 +122,7 @@ namespace Hangfire.Server
                 foreach (var recurringJobId in recurringJobIds)
                 {
                     var recurringJob = connection.GetAllEntriesFromHash(
-                        String.Format("recurring-job:{0}", recurringJobId));
+                        $"recurring-job:{recurringJobId}");
 
                     if (recurringJob == null)
                     {
@@ -75,58 +131,125 @@ namespace Hangfire.Server
 
                     try
                     {
-                        TryScheduleJob(connection, recurringJobId, recurringJob);
+                        TryScheduleJob(context.Storage, connection, recurringJobId, recurringJob);
                     }
                     catch (JobLoadException ex)
                     {
-                        Logger.WarnFormat("Recurring job '{0}' can not be scheduled due to job load exception.", ex, recurringJobId);
+                        Logger.WarnException(
+                            $"Recurring job '{recurringJobId}' can not be scheduled due to job load exception.",
+                            ex);
                     }
                 }
-
-                _throttler.Delay(cancellationToken);
             }
+
+            // The code above may be completed in less than a second. Default throttler use
+            // the second resolution, and without an extra delay, CPU and DB bursts may happen.
+            _throttler.Delay(context.CancellationToken);
         }
 
+        /// <inheritdoc />
         public override string ToString()
         {
-            return "Recurring Job Scheduler";
+            return GetType().Name;
         }
 
-        private void TryScheduleJob(IStorageConnection connection, string recurringJobId, Dictionary<string, string> recurringJob)
+        private void TryScheduleJob(
+            JobStorage storage,
+            IStorageConnection connection, 
+            string recurringJobId, 
+            IReadOnlyDictionary<string, string> recurringJob)
         {
             var serializedJob = JobHelper.FromJson<InvocationData>(recurringJob["Job"]);
             var job = serializedJob.Deserialize();
             var cron = recurringJob["Cron"];
             var cronSchedule = CrontabSchedule.Parse(cron);
-            var instant = _instantFactory.GetInstant(cronSchedule);
 
-            var lastExecutionTime = recurringJob.ContainsKey("LastExecution")
-                ? JobHelper.DeserializeDateTime(recurringJob["LastExecution"])
-                : (DateTime?)null;
-
-            if (instant.GetMatches(lastExecutionTime).Any())
+            try
             {
-                var state = new EnqueuedState { Reason = "Triggered by recurring job scheduler" };
-                var jobId = _client.Create(job, state);
+                var timeZone = recurringJob.ContainsKey("TimeZoneId")
+                    ? TimeZoneInfo.FindSystemTimeZoneById(recurringJob["TimeZoneId"])
+                    : TimeZoneInfo.Utc;
+
+                var nowInstant = _instantFactory(cronSchedule, timeZone);
+                var changedFields = new Dictionary<string, string>();
+
+                var lastInstant = GetLastInstant(recurringJob, nowInstant);
+                
+                if (nowInstant.GetNextInstants(lastInstant).Any())
+                {
+                    var state = new EnqueuedState { Reason = "Triggered by recurring job scheduler" };
+                    if (recurringJob.ContainsKey("Queue") && !String.IsNullOrEmpty(recurringJob["Queue"]))
+                    {
+                        state.Queue = recurringJob["Queue"];
+                    }
+
+                    var context = new CreateContext(storage, connection, job, state);
+                    context.Parameters["RecurringJobId"] = recurringJobId;
+
+                    var backgroundJob = _factory.Create(context);
+                    var jobId = backgroundJob?.Id;
+
+                    if (String.IsNullOrEmpty(jobId))
+                    {
+                        Logger.Debug($"Recurring job '{recurringJobId}' execution at '{nowInstant.NowInstant}' has been canceled.");
+                    }
+
+                    changedFields.Add("LastExecution", JobHelper.SerializeDateTime(nowInstant.NowInstant));
+                    changedFields.Add("LastJobId", jobId ?? String.Empty);
+                }
+                
+                // Fixing old recurring jobs that doesn't have the CreatedAt field
+                if (!recurringJob.ContainsKey("CreatedAt"))
+                {
+                    changedFields.Add("CreatedAt", JobHelper.SerializeDateTime(nowInstant.NowInstant));
+                }
+                    
+                changedFields.Add("NextExecution", nowInstant.NextInstant.HasValue ? JobHelper.SerializeDateTime(nowInstant.NextInstant.Value) : null);
 
                 connection.SetRangeInHash(
-                    String.Format("recurring-job:{0}", recurringJobId),
-                    new Dictionary<string, string>
-                        {
-                            { "LastExecution", JobHelper.SerializeDateTime(instant.UtcTime) },
-                            { "LastJobId", jobId },
-                        });
+                    $"recurring-job:{recurringJobId}",
+                    changedFields);
+            }
+#if NETFULL
+            catch (TimeZoneNotFoundException ex)
+            {
+#else
+            catch (Exception ex)
+            {
+                // https://github.com/dotnet/corefx/issues/7552
+                if (!ex.GetType().Name.Equals("TimeZoneNotFoundException")) throw;
+#endif
+
+                Logger.ErrorException(
+                    $"Recurring job '{recurringJobId}' was not triggered: {ex.Message}.",
+                    ex);
             }
 
-            connection.SetRangeInHash(
-                String.Format("recurring-job:{0}", recurringJobId),
-                new Dictionary<string, string>
-                {
-                    {
-                        "NextExecution", 
-                        JobHelper.SerializeDateTime(instant.NextOccurrence)
-                    }
-                });
+        }
+
+        private static DateTime GetLastInstant(IReadOnlyDictionary<string, string> recurringJob, IScheduleInstant instant)
+        {
+            DateTime lastInstant;
+
+            if (recurringJob.ContainsKey("LastExecution"))
+            {
+                lastInstant = JobHelper.DeserializeDateTime(recurringJob["LastExecution"]);
+            }
+            else if (recurringJob.ContainsKey("CreatedAt"))
+            {
+                lastInstant = JobHelper.DeserializeDateTime(recurringJob["CreatedAt"]);
+            }
+            else if (recurringJob.ContainsKey("NextExecution"))
+            {
+                lastInstant = JobHelper.DeserializeDateTime(recurringJob["NextExecution"]);
+                lastInstant = lastInstant.AddSeconds(-1);
+            }
+            else
+            {
+                lastInstant = instant.NowInstant.AddSeconds(-1);
+            }
+
+            return lastInstant;
         }
     }
 }

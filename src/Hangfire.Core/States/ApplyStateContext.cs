@@ -15,28 +15,63 @@
 // License along with Hangfire. If not, see <http://www.gnu.org/licenses/>.
 
 using System;
+using Hangfire.Annotations;
 using Hangfire.Storage;
 
 namespace Hangfire.States
 {
+#pragma warning disable 618
     public class ApplyStateContext : StateContext
+#pragma warning restore 618
     {
-        public ApplyStateContext(StateContext context, IState newState, string oldStateName)
-            : base(context)
+        public ApplyStateContext(
+            [NotNull] IWriteOnlyTransaction transaction, 
+            [NotNull] ElectStateContext context)
+            : this(context.Storage, context.Connection, transaction, context.BackgroundJob, context.CandidateState, context.CurrentState)
         {
-            if (newState == null) throw new ArgumentNullException("newState");
+        }
 
+        public ApplyStateContext(
+            [NotNull] JobStorage storage,
+            [NotNull] IStorageConnection connection,
+            [NotNull] IWriteOnlyTransaction transaction,
+            [NotNull] BackgroundJob backgroundJob,
+            [NotNull] IState newState, 
+            [CanBeNull] string oldStateName)
+        {
+            if (storage == null) throw new ArgumentNullException(nameof(storage));
+            if (connection == null) throw new ArgumentNullException(nameof(connection));
+            if (transaction == null) throw new ArgumentNullException(nameof(transaction));
+            if (backgroundJob == null) throw new ArgumentNullException(nameof(backgroundJob));
+            if (newState == null) throw new ArgumentNullException(nameof(newState));
+            
+            BackgroundJob = backgroundJob;
+
+            Storage = storage;
+            Connection = connection;
+            Transaction = transaction;
             OldStateName = oldStateName;
             NewState = newState;
             JobExpirationTimeout = TimeSpan.FromDays(1);
         }
-        
-        // Hiding the connection from filters, because their methods are being 
-        // executed inside a transaction. This property can break them.
-        private new IStorageConnection Connection { get { return base.Connection; } }
 
-        public string OldStateName { get; private set; }
-        public IState NewState { get; private set; }
+        [NotNull]
+        public JobStorage Storage { get; }
+
+        [NotNull]
+        public IStorageConnection Connection { get; }
+
+        [NotNull]
+        public IWriteOnlyTransaction Transaction { get; }
+        
+        public override BackgroundJob BackgroundJob { get; }
+
+        [CanBeNull]
+        public string OldStateName { get; }
+
+        [NotNull]
+        public IState NewState { get; }
+        
         public TimeSpan JobExpirationTimeout { get; set; }
     }
 }

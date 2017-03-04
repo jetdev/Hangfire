@@ -14,14 +14,13 @@
 // You should have received a copy of the GNU Lesser General Public 
 // License along with Hangfire. If not, see <http://www.gnu.org/licenses/>.
 
-using System;
 using Hangfire.Common;
 using Hangfire.States;
 
 namespace Hangfire
 {
     /// <summary>
-    /// Represents attribute, that is being used to determine queue name
+    /// Represents attribute, that is used to determine queue name
     /// for background jobs. It can be applied to the methods and classes. 
     /// If the attribute is not applied neither to the method, nor the class, 
     /// then default queue will be used.
@@ -60,7 +59,7 @@ namespace Hangfire
         /// <summary>
         /// Gets the queue name that will be used for background jobs.
         /// </summary>
-        public string Queue { get; private set; }
+        public string Queue { get; }
 
         public void OnStateElection(ElectStateContext context)
         {

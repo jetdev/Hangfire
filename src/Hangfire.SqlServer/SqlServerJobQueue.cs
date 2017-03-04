@@ -16,90 +16,116 @@
 
 using System;
 using System.Data;
+using System.Data.Common;
 using System.Globalization;
 using System.Linq;
 using System.Threading;
 using Dapper;
-using Hangfire.SqlServer.Annotations;
+using Hangfire.Annotations;
 using Hangfire.Storage;
+
+// ReSharper disable RedundantAnonymousTypePropertyName
 
 namespace Hangfire.SqlServer
 {
     internal class SqlServerJobQueue : IPersistentJobQueue
     {
+        // This is an optimization that helps to overcome the polling delay, when
+        // both client and server reside in the same process. Everything is working
+        // without this event, but it helps to reduce the delays in processing.
+        internal static readonly AutoResetEvent NewItemInQueueEvent = new AutoResetEvent(true);
+
+        private readonly SqlServerStorage _storage;
         private readonly SqlServerStorageOptions _options;
-        private readonly IDbConnection _connection;
-
-        public SqlServerJobQueue(IDbConnection connection, SqlServerStorageOptions options)
+		
+        public SqlServerJobQueue([NotNull] SqlServerStorage storage, SqlServerStorageOptions options)
         {
-            if (options == null) throw new ArgumentNullException("options");
-            if (connection == null) throw new ArgumentNullException("connection");
+            if (storage == null) throw new ArgumentNullException(nameof(storage));
+            if (options == null) throw new ArgumentNullException(nameof(options));
 
+            _storage = storage;
             _options = options;
-            _connection = connection;
         }
 
         [NotNull]
         public IFetchedJob Dequeue(string[] queues, CancellationToken cancellationToken)
         {
-            if (queues == null) throw new ArgumentNullException("queues");
-            if (queues.Length == 0) throw new ArgumentException("Queue array must be non-empty.", "queues");
+            if (queues == null) throw new ArgumentNullException(nameof(queues));
+            if (queues.Length == 0) throw new ArgumentException("Queue array must be non-empty.", nameof(queues));
 
-            FetchedJob fetchedJob;
+            FetchedJob fetchedJob = null;
+            DbTransaction transaction = null;
 
-            const string fetchJobSqlTemplate = @"
-set transaction isolation level read committed
-update top (1) HangFire.JobQueue set FetchedAt = GETUTCDATE()
-output INSERTED.Id, INSERTED.JobId, INSERTED.Queue
-where FetchedAt {0}
-and Queue in @queues";
-
-            // Sql query is splitted to force SQL Server to use 
-            // INDEX SEEK instead of INDEX SCAN operator.
-            var fetchConditions = new[] { "is null", "< DATEADD(second, @timeout, GETUTCDATE())" };
-            var currentQueryIndex = 0;
+            string fetchJobSqlTemplate =
+$@"delete top (1) JQ
+output DELETED.Id, DELETED.JobId, DELETED.Queue
+from [{_storage.SchemaName}].JobQueue JQ with (readpast, updlock, rowlock, forceseek)
+where Queue in @queues";
 
             do
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                var connection = _storage.CreateAndOpenConnection();
 
-                fetchedJob = _connection.Query<FetchedJob>(
-                    String.Format(fetchJobSqlTemplate, fetchConditions[currentQueryIndex]),
-                    new { queues = queues, timeout = _options.InvisibilityTimeout.Negate().TotalSeconds })
-                    .SingleOrDefault();
-
-                if (fetchedJob == null)
+                try
                 {
-                    if (currentQueryIndex == fetchConditions.Length - 1)
+                    transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted);
+
+                    fetchedJob = connection.Query<FetchedJob>(
+                        fetchJobSqlTemplate,
+                        new { queues = queues },
+                        transaction,
+                        commandTimeout: _storage.CommandTimeout).SingleOrDefault();
+
+                    if (fetchedJob != null)
                     {
-                        cancellationToken.WaitHandle.WaitOne(_options.QueuePollInterval);
-                        cancellationToken.ThrowIfCancellationRequested();
+                        return new SqlServerFetchedJob(
+                            _storage,
+                            connection,
+                            transaction,
+                            fetchedJob.JobId.ToString(CultureInfo.InvariantCulture),
+                            fetchedJob.Queue);
+                    }
+                }
+                finally
+                {
+                    if (fetchedJob == null)
+                    {
+                        transaction?.Dispose();
+                        transaction = null;
+
+                        _storage.ReleaseConnection(connection);
                     }
                 }
 
-                currentQueryIndex = (currentQueryIndex + 1) % fetchConditions.Length;
-            } while (fetchedJob == null);
-
-            return new SqlServerFetchedJob(
-                _connection,
-                fetchedJob.Id,
-                fetchedJob.JobId.ToString(CultureInfo.InvariantCulture),
-                fetchedJob.Queue);
+                WaitHandle.WaitAny(new[] { cancellationToken.WaitHandle, NewItemInQueueEvent }, _options.QueuePollInterval);
+                cancellationToken.ThrowIfCancellationRequested();
+            } while (true);
         }
 
-        public void Enqueue(string queue, string jobId)
+#if NETFULL
+        public void Enqueue(IDbConnection connection, string queue, string jobId)
+#else
+        public void Enqueue(DbConnection connection, DbTransaction transaction, string queue, string jobId)
+#endif
         {
-            const string enqueueJobSql = @"
-insert into HangFire.JobQueue (JobId, Queue) values (@jobId, @queue)";
+            string enqueueJobSql =
+$@"insert into [{_storage.SchemaName}].JobQueue (JobId, Queue) values (@jobId, @queue)";
 
-            _connection.Execute(enqueueJobSql, new { jobId = jobId, queue = queue });
+            connection.Execute(
+                enqueueJobSql, 
+                new { jobId = long.Parse(jobId), queue = queue }
+#if !NETFULL
+                , transaction
+#endif
+                , commandTimeout: _storage.CommandTimeout);
         }
 
         [UsedImplicitly(ImplicitUseTargetFlags.WithMembers)]
         private class FetchedJob
         {
-            public int Id { get; set; }
-            public int JobId { get; set; }
+            public long Id { get; set; }
+            public long JobId { get; set; }
             public string Queue { get; set; }
         }
     }

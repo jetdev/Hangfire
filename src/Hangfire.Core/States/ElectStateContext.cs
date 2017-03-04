@@ -15,23 +15,46 @@
 // License along with Hangfire. If not, see <http://www.gnu.org/licenses/>.
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using Hangfire.Annotations;
 using Hangfire.Common;
+using Hangfire.Storage;
 
 namespace Hangfire.States
 {
+#pragma warning disable 618
     public class ElectStateContext : StateContext
+#pragma warning restore 618
     {
+        private readonly IList<IState> _traversedStates = new List<IState>();
         private IState _candidateState;
 
-        internal ElectStateContext(StateContext context, IState candidateState, string currentState)
-            : base(context)
+        public ElectStateContext([NotNull] ApplyStateContext applyContext)
         {
-            if (candidateState == null) throw new ArgumentNullException("candidateState");
+            if (applyContext == null) throw new ArgumentNullException(nameof(applyContext));
+            
+            BackgroundJob = applyContext.BackgroundJob;
+            _candidateState = applyContext.NewState;
 
-            CandidateState = candidateState;
-            CurrentState = currentState;
+            Storage = applyContext.Storage;
+            Connection = applyContext.Connection;
+            Transaction = applyContext.Transaction;
+            CurrentState = applyContext.OldStateName;
         }
+        
+        public override BackgroundJob BackgroundJob { get; }
 
+        [NotNull]
+        public JobStorage Storage { get; }
+
+        [NotNull]
+        public IStorageConnection Connection { get; }
+
+        [NotNull]
+        public IWriteOnlyTransaction Transaction { get; }
+
+        [NotNull]
         public IState CandidateState
         {
             get { return _candidateState; }
@@ -39,23 +62,32 @@ namespace Hangfire.States
             {
                 if (value == null)
                 {
-                    throw new ArgumentNullException("value", "The CandidateState property can not be set to null.");
+                    throw new ArgumentNullException(nameof(value), "The CandidateState property can not be set to null.");
                 }
-                _candidateState = value;
+
+                if (_candidateState != value)
+                {
+                    _traversedStates.Add(_candidateState);
+                    _candidateState = value;
+                }
             }
         }
 
+        [CanBeNull]
         public string CurrentState { get; private set; }
+
+        [NotNull]
+        public IState[] TraversedStates => _traversedStates.ToArray();
 
         public void SetJobParameter<T>(string name, T value)
         {
-            Connection.SetJobParameter(JobId, name, JobHelper.ToJson(value));
+            Connection.SetJobParameter(BackgroundJob.Id, name, JobHelper.ToJson(value));
         }
 
         public T GetJobParameter<T>(string name)
         {
             return JobHelper.FromJson<T>(Connection.GetJobParameter(
-                JobId, name));
+                BackgroundJob.Id, name));
         }
     }
 }
